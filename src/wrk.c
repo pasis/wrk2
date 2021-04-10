@@ -13,6 +13,10 @@
 // Max recordable latency of 1 day
 #define MAX_LATENCY 24L * 60 * 60 * 1000000
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#endif
+
 static struct config {
     uint64_t threads;
     uint64_t connections;
@@ -27,6 +31,7 @@ static struct config {
     bool     record_all_responses;
     char    *host;
     char    *script;
+    char    *local_ip;
     SSL_CTX *ctx;
 } cfg;
 
@@ -49,8 +54,8 @@ static struct http_parser_settings parser_settings = {
 
 static volatile sig_atomic_t stop = 0;
 
-/* XXX This is a hack not to pass parameter to the script module. */
-static const char *g_local_ip = NULL;
+// XXX This is a hack not to pass parameter to the script module.
+char *g_local_ip = NULL;
 
 static void handler(int sig) {
     stop = 1;
@@ -60,7 +65,8 @@ static void usage() {
     printf("Usage: wrk <options> <url>                            \n"
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
-           "    -i, --local_ip    <S>  Bind to the specified local IP\n"
+           "    -i, --local_ip    <S>  Bind to the specified local IP(s)\n"
+           "                           It can be a comma separated list\n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
            "                                                      \n"
@@ -110,7 +116,30 @@ int main(int argc, char **argv) {
     }
 	
     cfg.host = host;
-	
+
+    // Split comma separated IPs list into the array.
+    char *local_ip_arr[32];
+    size_t local_ip_nr = 0;
+    char *local_ip_tokens = cfg.local_ip != NULL ? strdup(cfg.local_ip) : NULL;
+    if (local_ip_tokens != NULL) {
+        char *saveptr = NULL;
+        char *token = strtok_r(local_ip_tokens, ",", &saveptr);
+
+        while (token != NULL) {
+            if (*token != '\0') {
+                if (local_ip_nr >= ARRAY_SIZE(local_ip_arr)) {
+                    fprintf(stderr, "Number of IPs exceeds predefined maximum (%zu). "
+                            "Ignoring the extra addresses.\n", ARRAY_SIZE(local_ip_arr));
+                    break;
+                }
+                local_ip_arr[local_ip_nr++] = token;
+            }
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+        if (local_ip_nr > 0)
+            g_local_ip = local_ip_arr[0];
+    }
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT,  SIG_IGN);
 
@@ -118,8 +147,8 @@ int main(int argc, char **argv) {
     statistics.requests = stats_alloc(10);
     thread *threads = zcalloc(cfg.threads * sizeof(thread));
 
-    hdr_init(1, MAX_LATENCY, 3, &(statistics.requests->histogram));
 
+    hdr_init(1, MAX_LATENCY, 3, &(statistics.requests->histogram));
 
     lua_State *L = script_create(cfg.script, url, headers);
     if (!script_resolve(L, host, service)) {
@@ -134,10 +163,14 @@ int main(int argc, char **argv) {
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
+        // TODO Review whether we can reduce number of events per thread
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
         t->throughput = throughput;
         t->stop_at     = stop_at;
+
+        if (local_ip_nr > 0)
+            t->local_ip = local_ip_arr[i % local_ip_nr];
 
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
@@ -255,6 +288,8 @@ int main(int argc, char **argv) {
         script_done(L, latency_stats, statistics.requests);
     }
 
+    free(local_ip_tokens);
+
     return 0;
 }
 
@@ -306,7 +341,7 @@ void *thread_main(void *arg) {
     return NULL;
 }
 
-void bind_socket(int fd)
+void bind_socket(int fd, char *addr)
 {
     struct sockaddr_in sa;
     int rc;
@@ -316,7 +351,7 @@ void bind_socket(int fd)
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
-    rc = inet_aton(g_local_ip, &sa.sin_addr);
+    rc = inet_aton(addr, &sa.sin_addr);
     assert(rc != 0);
     rc = bind(fd, (struct sockaddr*)&sa, sizeof sa);
     assert(rc == 0);
@@ -334,7 +369,8 @@ static int connect_socket(thread *thread, connection *c) {
         exit(1);
     }
 
-    bind_socket(fd);
+    if (thread->local_ip != NULL)
+        bind_socket(fd, thread->local_ip);
 
     flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -764,7 +800,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 if (scan_metric(optarg, &cfg->connections)) return -1;
                 break;
             case 'i':
-                g_local_ip = optarg;
+                cfg->local_ip = optarg;
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;

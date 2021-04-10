@@ -44,6 +44,7 @@ typedef struct {
     lua_State *L;
     errors errors;
     struct connection *cs;
+    char *local_ip;
 } thread;
 
 typedef struct {
@@ -84,5 +85,9 @@ typedef struct connection {
     uint64_t latest_connect;
     uint64_t latest_write;
 } connection;
+
+extern char *g_local_ip;
+
+void bind_socket(int fd, char *addr);
 
 #endif /* WRK_H */
