@@ -60,6 +60,7 @@ typedef struct connection {
         FIELD, VALUE
     } state;
     int fd;
+    int connect_mask;
     SSL *ssl;
     double throughput;
     double catch_up_throughput;
