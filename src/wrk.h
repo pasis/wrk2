@@ -24,12 +24,15 @@
 #define SOCKET_TIMEOUT_MS   2000
 #define CALIBRATE_DELAY_MS  10000
 #define TIMEOUT_INTERVAL_MS 2000
+#define STOP_CHECK_INTERNAL_MS 2000
 
 typedef struct {
     pthread_t thread;
     aeEventLoop *loop;
     struct addrinfo *addr;
     uint64_t connections;
+    uint64_t phase_normal_start;
+    int phase;
     int interval;
     uint64_t stop_at;
     uint64_t complete;
@@ -78,6 +81,7 @@ typedef struct connection {
     buffer body;
     char buf[RECVBUF];
     uint64_t actual_latency_start;
+    bool is_connected;
     bool has_pending;
     bool caught_up;
     // Internal tracking numbers (used purely for debugging):
