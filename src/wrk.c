@@ -153,7 +153,6 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT,  SIG_IGN);
 
     pthread_mutex_init(&statistics.mutex, NULL);
     statistics.requests = stats_alloc(10);
