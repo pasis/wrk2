@@ -25,6 +25,7 @@
 #define CALIBRATE_DELAY_MS  10000
 #define TIMEOUT_INTERVAL_MS 2000
 #define STOP_CHECK_INTERNAL_MS 2000
+#define THREAD_SYNC_INTERVAL_MS 1000
 
 typedef struct {
     pthread_t thread;

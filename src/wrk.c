@@ -66,6 +66,9 @@ static volatile sig_atomic_t stop = 0;
 // XXX This is a hack not to pass parameter to the script module.
 char *g_local_ip = NULL;
 
+int g_ready_threads = 0;
+static volatile sig_atomic_t g_is_ready = 0;
+
 static void handler(int sig) {
     stop = 1;
 }
@@ -559,6 +562,16 @@ static int warmup_timed_out(aeEventLoop *loop, long long id, void *data) {
     return AE_NOMORE;
 }
 
+static int inter_thread_sync(aeEventLoop *loop, long long id, void *data) {
+    thread *thread = data;
+
+    if (g_is_ready) {
+        phase_move(thread, PHASE_NORMAL);
+    }
+
+    return thread->phase == PHASE_NORMAL ? AE_NOMORE : THREAD_SYNC_INTERVAL_MS;
+}
+
 static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
 
@@ -787,9 +800,15 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
         aeCreateFileEvent(c->thread->loop, fd, AE_WRITABLE, socket_writeable, c);
     }
 
-    // TODO Improve how we decide when to move to NORMAL phase
-    if (c->thread->errors.established == c->thread->connections) {
-        phase_move(c->thread, PHASE_NORMAL);
+    if (cfg.warmup && c->thread->errors.established == c->thread->connections) {
+        // Create a timed event to periodically check whether all threads are finished
+        // with handshakes. Without a synchronization can get high concurrency between
+        // TLS handshakes and requests.
+        aeCreateTimeEvent(c->thread->loop, THREAD_SYNC_INTERVAL_MS, inter_thread_sync, c->thread, NULL);
+        int counter = __sync_add_and_fetch(&g_ready_threads, 1);
+        if (counter == cfg.threads) {
+            g_is_ready = 1;
+        }
     }
 
     return;
