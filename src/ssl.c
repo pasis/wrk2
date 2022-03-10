@@ -37,6 +37,10 @@ SSL_CTX *ssl_init() {
 
         CRYPTO_set_locking_callback(ssl_lock);
         CRYPTO_set_id_callback(ssl_id);
+        // CRYPTO_set_locking_callback() and CRYPTO_set_id_callback() can be stub
+        // Shut defined-but-unused warning
+        (void)ssl_lock;
+        (void)ssl_id;
 
         if ((ctx = SSL_CTX_new(SSLv23_client_method()))) {
             SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);

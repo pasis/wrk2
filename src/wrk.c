@@ -272,7 +272,6 @@ int main(int argc, char **argv) {
     print_stats_header();
     print_stats("Latency", latency_stats, format_time_us);
     print_stats("Req/Sec", statistics.requests, format_metric);
-//    if (cfg.latency) print_stats_latency(latency_stats);
 
     if (cfg.latency) {
         print_hdr_latency(latency_histogram,
@@ -698,20 +697,20 @@ static int response_complete(http_parser *parser) {
         printf("This wil never ever ever happen...");
         printf("But when it does. The following information will help in debugging");
         printf("response_complete:\n");
-        printf("  expected_latency_timing = %lld\n", expected_latency_timing);
-        printf("  now = %lld\n", now);
-        printf("  expected_latency_start = %lld\n", expected_latency_start);
-        printf("  c->thread_start = %lld\n", c->thread_start);
-        printf("  c->complete = %lld\n", c->complete);
+        printf("  expected_latency_timing = %"PRId64"\n", expected_latency_timing);
+        printf("  now = %"PRIu64"\n", now);
+        printf("  expected_latency_start = %"PRIu64"\n", expected_latency_start);
+        printf("  c->thread_start = %"PRIu64"\n", c->thread_start);
+        printf("  c->complete = %"PRIu64"\n", c->complete);
         printf("  throughput = %g\n", c->throughput);
-        printf("  latest_should_send_time = %lld\n", c->latest_should_send_time);
-        printf("  latest_expected_start = %lld\n", c->latest_expected_start);
-        printf("  latest_connect = %lld\n", c->latest_connect);
-        printf("  latest_write = %lld\n", c->latest_write);
+        printf("  latest_should_send_time = %"PRIu64"\n", c->latest_should_send_time);
+        printf("  latest_expected_start = %"PRIu64"\n", c->latest_expected_start);
+        printf("  latest_connect = %"PRIu64"\n", c->latest_connect);
+        printf("  latest_write = %"PRIu64"\n", c->latest_write);
 
         expected_latency_start = c->thread_start +
                 ((c->complete ) / c->throughput);
-        printf("  next expected_latency_start = %lld\n", expected_latency_start);
+        printf("  next expected_latency_start = %"PRIu64"\n", expected_latency_start);
     }
 
     c->latest_should_send_time = 0;
@@ -1035,7 +1034,7 @@ static void print_stats(char *name, stats *stats, char *(*fmt)(long double)) {
 }
 
 static void print_hdr_latency(struct hdr_histogram* histogram, const char* description) {
-    long double percentiles[] = { 50.0, 75.0, 90.0, 99.0, 99.9, 99.99, 99.999, 100.0};
+    long double percentiles[] = { 50.0, 75.0, 90.0, 99.0, 99.9, 99.99, 99.999, 100.0 };
     printf("  Latency Distribution (HdrHistogram - %s)\n", description);
     for (size_t i = 0; i < sizeof(percentiles) / sizeof(long double); i++) {
         long double p = percentiles[i];
@@ -1046,16 +1045,4 @@ static void print_hdr_latency(struct hdr_histogram* histogram, const char* descr
     }
     printf("\n%s\n", "  Detailed Percentile spectrum:");
     hdr_percentiles_print(histogram, stdout, 5, 1000.0, CLASSIC);
-}
-
-static void print_stats_latency(stats *stats) {
-    long double percentiles[] = { 50.0, 75.0, 90.0, 99.0, 99.9, 99.99, 99.999, 100.0 };
-    printf("  Latency Distribution\n");
-    for (size_t i = 0; i < sizeof(percentiles) / sizeof(long double); i++) {
-        long double p = percentiles[i];
-        uint64_t n = stats_percentile(stats, p);
-        printf("%7.3Lf%%", p);
-        print_units(n, format_time_us, 10);
-        printf("\n");
-    }
 }
