@@ -34,7 +34,6 @@ static struct config {
     uint64_t delay_ms;
     uint64_t warmup_timeout;
     bool     latency;
-    bool     u_latency;
     bool     dynamic;
     bool     record_all_responses;
     bool     warmup;
@@ -86,7 +85,6 @@ static void usage() {
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
            "    -L  --latency          Print latency statistics   \n"
-           "    -U  --u_latency        Print uncorrected latency statistics\n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -B, --batch_latency    Measure latency of whole   \n"
            "                           batches of pipelined ops   \n"
@@ -243,8 +241,6 @@ int main(int argc, char **argv) {
 
     struct hdr_histogram* latency_histogram;
     hdr_init(1, MAX_LATENCY, 3, &latency_histogram);
-    struct hdr_histogram* u_latency_histogram;
-    hdr_init(1, MAX_LATENCY, 3, &u_latency_histogram);
 
     uint64_t phase_normal_start_min = 0;
 
@@ -278,7 +274,6 @@ int main(int argc, char **argv) {
         errors.reconnect += t->errors.reconnect;
 
         hdr_add(latency_histogram, t->latency_histogram);
-        hdr_add(u_latency_histogram, t->u_latency_histogram);
     }
 
     long double runtime_s   = runtime_us / 1000000.0;
@@ -297,13 +292,6 @@ int main(int argc, char **argv) {
     if (cfg.latency) {
         print_hdr_latency(latency_histogram,
                 "Recorded Latency");
-        printf("----------------------------------------------------------\n");
-    }
-
-    if (cfg.u_latency) {
-        printf("\n");
-        print_hdr_latency(u_latency_histogram,
-                "Uncorrected Latency (measured without taking delayed starts into account)");
         printf("----------------------------------------------------------\n");
     }
 
@@ -364,7 +352,6 @@ void *thread_main(void *arg) {
     thread->cs = zcalloc(thread->connections * sizeof(connection));
     tinymt64_init(&thread->rand, time_us());
     hdr_init(1, MAX_LATENCY, 3, &thread->latency_histogram);
-    hdr_init(1, MAX_LATENCY, 3, &thread->u_latency_histogram);
 
     char *request = NULL;
     size_t length = 0;
@@ -553,7 +540,6 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
 
     thread->mean     = (uint64_t) mean;
     hdr_reset(thread->latency_histogram);
-    hdr_reset(thread->u_latency_histogram);
 
     thread->start    = time_us();
     thread->interval = interval;
@@ -734,41 +720,6 @@ static int response_complete(http_parser *parser) {
     // Count all responses (including pipelined ones:)
     c->rate_handler.sent++;
 
-    // Note that expected start time is computed based on the completed
-    // response count seen at the beginning of the last request batch sent.
-    // A single request batch send may contain multiple requests, and
-    // result in multiple responses. If we incorrectly calculated expect
-    // start time based on the completion count of these individual pipelined
-    // requests we can easily end up "gifting" them time and seeing
-    // negative latencies.
-    uint64_t expected_latency_start = c->rate_handler.thread_start +
-            (c->complete_at_last_batch_start / c->rate_handler.throughput);
-
-
-    int64_t expected_latency_timing = now - expected_latency_start;
-
-    if (expected_latency_timing < 0) {
-        printf("\n\n ---------- \n\n");
-        printf("We are about to crash and die (recoridng a negative #)");
-        printf("This wil never ever ever happen...");
-        printf("But when it does. The following information will help in debugging");
-        printf("response_complete:\n");
-        printf("  expected_latency_timing = %"PRId64"\n", expected_latency_timing);
-        printf("  now = %"PRIu64"\n", now);
-        printf("  expected_latency_start = %"PRIu64"\n", expected_latency_start);
-        printf("  c->thread_start = %"PRIu64"\n", c->rate_handler.thread_start);
-        printf("  c->complete = %"PRIu64"\n", c->rate_handler.sent);
-        printf("  throughput = %g\n", c->rate_handler.throughput);
-        printf("  latest_should_send_time = %"PRIu64"\n", c->latest_should_send_time);
-        printf("  latest_expected_start = %"PRIu64"\n", c->latest_expected_start);
-        printf("  latest_connect = %"PRIu64"\n", c->latest_connect);
-        printf("  latest_write = %"PRIu64"\n", c->latest_write);
-
-        expected_latency_start = c->rate_handler.thread_start +
-                ((c->rate_handler.sent ) / c->rate_handler.throughput);
-        printf("  next expected_latency_start = %"PRIu64"\n", expected_latency_start);
-    }
-
     c->latest_should_send_time = 0;
     c->latest_expected_start = 0;
 
@@ -779,10 +730,8 @@ static int response_complete(http_parser *parser) {
 
     // Record if needed, either last in batch or all, depending in cfg:
     if (cfg.record_all_responses || !c->has_pending) {
-        hdr_record_value(thread->latency_histogram, expected_latency_timing);
-
         uint64_t actual_latency_timing = now - c->actual_latency_start;
-        hdr_record_value(thread->u_latency_histogram, actual_latency_timing);
+        hdr_record_value(thread->latency_histogram, actual_latency_timing);
     }
 
 
@@ -976,7 +925,6 @@ static struct option longopts[] = {
     { "script",         required_argument, NULL, 's' },
     { "header",         required_argument, NULL, 'H' },
     { "latency",        no_argument,       NULL, 'L' },
-    { "u_latency",      no_argument,       NULL, 'U' },
     { "batch_latency",  no_argument,       NULL, 'B' },
     { "timeout",        required_argument, NULL, 'T' },
     { "help",           no_argument,       NULL, 'h' },
@@ -1025,10 +973,6 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'B':
                 cfg->record_all_responses = false;
-                break;
-            case 'U':
-                cfg->latency = true;
-                cfg->u_latency = true;
                 break;
             case 'T':
                 if (scan_time(optarg, &cfg->timeout)) return -1;
