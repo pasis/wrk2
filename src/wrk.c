@@ -38,6 +38,7 @@ static struct config {
     bool     dynamic;
     bool     record_all_responses;
     bool     warmup;
+    bool     rate_by_thread;
     char    *host;
     char    *script;
     char    *local_ip;
@@ -97,6 +98,9 @@ static void usage() {
            "    -W  --warmup           Enable warmup phase        \n"
            "                           In warmup phase connections are establised,\n"
            "                           but no requests are sent   \n"
+           "    -r  --rate_per_thread  Use rate limit per thread  \n"
+           "                           instead of per connection. \n"
+           "                           Might help to reduce traffic bursts\n"
            "                                                      \n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
@@ -194,7 +198,7 @@ int main(int argc, char **argv) {
         // TODO Review whether we can reduce number of events per thread
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = connections;
-        t->throughput = throughput;
+        t->rate_handler.throughput = throughput;
         t->stop_at     = stop_at;
 
         if (local_ip_nr > 0)
@@ -369,19 +373,26 @@ void *thread_main(void *arg) {
         script_request(thread->L, &request, &length);
     }
 
-    double throughput = (thread->throughput / 1000000.0) / thread->connections;
+    double throughput = (thread->rate_handler.throughput / 1000000.0) / thread->connections;
 
     connection *c = thread->cs;
+
+    if (cfg.rate_by_thread) {
+        thread->rate_handler.throughput = thread->rate_handler.throughput / 1000000.0;
+        thread->rate_handler.catch_up_throughput = thread->rate_handler.throughput * 2;
+        thread->rate_handler.sent = 0;
+        thread->rate_handler.caught_up = true;
+    }
 
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         c->thread     = thread;
         c->ssl        = cfg.ctx ? SSL_new(cfg.ctx) : NULL;
         c->request    = request;
         c->length     = length;
-        c->throughput = throughput;
-        c->catch_up_throughput = throughput * 2;
-        c->complete   = 0;
-        c->caught_up  = true;
+        c->rate_handler.throughput = throughput;
+        c->rate_handler.catch_up_throughput = throughput * 2;
+        c->rate_handler.sent = 0;
+        c->rate_handler.caught_up = true;
         // Stagger connects 5 msec apart within thread:
         aeCreateTimeEvent(loop, i * 5, delayed_initial_connect, c, NULL);
     }
@@ -525,7 +536,7 @@ static int reconnect_socket(thread *thread, connection *c) {
 
 static int delayed_initial_connect(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
-    c->thread_start = time_us();
+    c->rate_handler.thread_start = time_us();
     connect_socket(c->thread, c);
     return AE_NOMORE;
 }
@@ -631,30 +642,40 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
 
 static uint64_t usec_to_next_send(connection *c) {
     uint64_t now = time_us();
+    rate_handler_t *rate_handler =
+        (cfg.rate_by_thread) ? &c->thread->rate_handler : &c->rate_handler;
 
-    uint64_t next_start_time = c->thread_start + (c->complete / c->throughput);
+    uint64_t next_start_time =
+        rate_handler->thread_start + (rate_handler->sent / rate_handler->throughput);
 
     bool send_now = true;
 
+    if (cfg.rate_by_thread) {
+        if (rate_handler->sent == 0) {
+            rate_handler->thread_start = now;
+            goto ret;
+        }
+    }
+
     if (next_start_time > now) {
         // We are on pace. Indicate caught_up and don't send now.
-        c->caught_up = true;
+        rate_handler->caught_up = true;
         send_now = false;
     } else {
         // We are behind
-        if (c->caught_up) {
+        if (rate_handler->caught_up) {
             // This is the first fall-behind since we were last caught up
-            c->caught_up = false;
-            c->catch_up_start_time = now;
-            c->complete_at_catch_up_start = c->complete;
+            rate_handler->caught_up = false;
+            rate_handler->catch_up_start_time = now;
+            rate_handler->complete_at_catch_up_start = rate_handler->sent;
         }
 
         // Figure out if it's time to send, per catch up throughput:
         uint64_t complete_since_catch_up_start =
-                c->complete - c->complete_at_catch_up_start;
+            rate_handler->sent - rate_handler->complete_at_catch_up_start;
 
-        next_start_time = c->catch_up_start_time +
-                (complete_since_catch_up_start / c->catch_up_throughput);
+        next_start_time = rate_handler->catch_up_start_time +
+            (complete_since_catch_up_start / rate_handler->catch_up_throughput);
 
         if (next_start_time > now) {
             // Not yet time to send, even at catch-up throughout:
@@ -662,9 +683,13 @@ static uint64_t usec_to_next_send(connection *c) {
         }
     }
 
+ret:
     if (send_now) {
         c->latest_should_send_time = now;
         c->latest_expected_start = next_start_time;
+        if (cfg.rate_by_thread) {
+            rate_handler->sent++;
+        }
     }
 
     return send_now ? 0 : (next_start_time - now);
@@ -672,9 +697,11 @@ static uint64_t usec_to_next_send(connection *c) {
 
 static int delay_request(aeEventLoop *loop, long long id, void *data) {
     connection* c = data;
-    uint64_t time_usec_to_wait = usec_to_next_send(c);
-    if (time_usec_to_wait) {
-        return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */
+    if (!cfg.rate_by_thread) {
+        uint64_t time_usec_to_wait = usec_to_next_send(c);
+        if (time_usec_to_wait) {
+            return round((time_usec_to_wait / 1000.0L) + 0.5); /* don't send, wait */
+        }
     }
     aeCreateFileEvent(c->thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
     return AE_NOMORE;
@@ -705,7 +732,7 @@ static int response_complete(http_parser *parser) {
     }
 
     // Count all responses (including pipelined ones:)
-    c->complete++;
+    c->rate_handler.sent++;
 
     // Note that expected start time is computed based on the completed
     // response count seen at the beginning of the last request batch sent.
@@ -714,8 +741,9 @@ static int response_complete(http_parser *parser) {
     // start time based on the completion count of these individual pipelined
     // requests we can easily end up "gifting" them time and seeing
     // negative latencies.
-    uint64_t expected_latency_start = c->thread_start +
-            (c->complete_at_last_batch_start / c->throughput);
+    uint64_t expected_latency_start = c->rate_handler.thread_start +
+            (c->complete_at_last_batch_start / c->rate_handler.throughput);
+
 
     int64_t expected_latency_timing = now - expected_latency_start;
 
@@ -728,16 +756,16 @@ static int response_complete(http_parser *parser) {
         printf("  expected_latency_timing = %"PRId64"\n", expected_latency_timing);
         printf("  now = %"PRIu64"\n", now);
         printf("  expected_latency_start = %"PRIu64"\n", expected_latency_start);
-        printf("  c->thread_start = %"PRIu64"\n", c->thread_start);
-        printf("  c->complete = %"PRIu64"\n", c->complete);
-        printf("  throughput = %g\n", c->throughput);
+        printf("  c->thread_start = %"PRIu64"\n", c->rate_handler.thread_start);
+        printf("  c->complete = %"PRIu64"\n", c->rate_handler.sent);
+        printf("  throughput = %g\n", c->rate_handler.throughput);
         printf("  latest_should_send_time = %"PRIu64"\n", c->latest_should_send_time);
         printf("  latest_expected_start = %"PRIu64"\n", c->latest_expected_start);
         printf("  latest_connect = %"PRIu64"\n", c->latest_connect);
         printf("  latest_write = %"PRIu64"\n", c->latest_write);
 
-        expected_latency_start = c->thread_start +
-                ((c->complete ) / c->throughput);
+        expected_latency_start = c->rate_handler.thread_start +
+                ((c->rate_handler.sent ) / c->rate_handler.throughput);
         printf("  next expected_latency_start = %"PRIu64"\n", expected_latency_start);
     }
 
@@ -848,6 +876,11 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
             int msec_to_wait = round((time_usec_to_wait / 1000.0L) + 0.5);
 
             // Not yet time to send. Delay:
+            if (cfg.rate_by_thread) {
+                // in case the rate is controlled by the thread
+                // we wait 1ms for the specific connection
+                msec_to_wait = 1;
+            }
             aeDeleteFileEvent(loop, fd, AE_WRITABLE);
             aeCreateTimeEvent(
                     thread->loop, msec_to_wait, delay_request, c, NULL);
@@ -868,7 +901,7 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
         c->start = time_us();
         if (!c->has_pending) {
             c->actual_latency_start = c->start;
-            c->complete_at_last_batch_start = c->complete;
+            c->complete_at_last_batch_start = c->rate_handler.sent;
             c->has_pending = true;
         }
         c->pending = cfg.pipeline;
@@ -950,6 +983,7 @@ static struct option longopts[] = {
     { "version",        no_argument,       NULL, 'v' },
     { "rate",           required_argument, NULL, 'R' },
     { "warmup",         no_argument,       NULL, 'W' },
+    { "rate_per_thread",no_argument,       NULL, 'r' },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -1009,6 +1043,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'W':
                 cfg->warmup = true;
+                break;
+            case 'r':
+                cfg->rate_by_thread = true;
                 break;
             case 'h':
             case '?':
