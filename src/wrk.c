@@ -557,11 +557,22 @@ static int calibrate(aeEventLoop *loop, long long id, void *data) {
     return AE_NOMORE;
 }
 
+static void close_all_conn(thread *thread) {
+    connection *c = thread->cs;
+
+    for (uint64_t i = 0; i < thread->connections; i++, c++) {
+        aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
+        sock.close(c);
+        close(c->fd);
+    }
+}
+
 static int check_stop(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
     uint64_t now   = time_us();
 
     if (stop || now >= thread->stop_at) {
+        close_all_conn(thread);
         aeStop(loop);
     }
 
