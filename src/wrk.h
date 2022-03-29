@@ -28,6 +28,16 @@
 #define THREAD_SYNC_INTERVAL_MS 1000
 
 typedef struct {
+    double throughput;
+    uint64_t sent;
+    bool caught_up;
+    uint64_t catch_up_start_time;
+    uint64_t complete_at_catch_up_start;
+    double catch_up_throughput;
+    uint64_t thread_start;
+} rate_handler_t;
+
+typedef struct {
     pthread_t thread;
     aeEventLoop *loop;
     struct addrinfo *addr;
@@ -40,7 +50,6 @@ typedef struct {
     uint64_t requests;
     uint64_t bytes;
     uint64_t start;
-    double throughput;
     uint64_t mean;
     struct hdr_histogram *latency_histogram;
     struct hdr_histogram *u_latency_histogram;
@@ -49,6 +58,7 @@ typedef struct {
     errors errors;
     struct connection *cs;
     char *local_ip;
+    rate_handler_t rate_handler;
 } thread;
 
 typedef struct {
@@ -66,13 +76,8 @@ typedef struct connection {
     int fd;
     int connect_mask;
     SSL *ssl;
-    double throughput;
-    double catch_up_throughput;
-    uint64_t complete;
+    rate_handler_t rate_handler;
     uint64_t complete_at_last_batch_start;
-    uint64_t catch_up_start_time;
-    uint64_t complete_at_catch_up_start;
-    uint64_t thread_start;
     uint64_t start;
     char *request;
     size_t length;
@@ -84,7 +89,6 @@ typedef struct connection {
     uint64_t actual_latency_start;
     bool is_connected;
     bool has_pending;
-    bool caught_up;
     // Internal tracking numbers (used purely for debugging):
     uint64_t latest_should_send_time;
     uint64_t latest_expected_start;
